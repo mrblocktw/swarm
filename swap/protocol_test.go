@@ -233,11 +233,9 @@ func TestEmitCheque(t *testing.T) {
 	debitorSwap, cleanDebitorSwap := newTestSwap(t, beneficiaryKey, testBackend)
 	defer cleanDebitorSwap()
 
-	// setup the wait for mined transaction function for testing
-	cleanup := setupContractTest()
-	defer cleanup()
-	// now we need to create the channel...
-	testBackend.cashDone = make(chan struct{})
+	cashChequeDone := make(chan *CashoutRequest)
+	defer close(cashChequeDone)
+	creditorSwap.cashoutProcessor.setCashoutDoneChan(cashChequeDone)
 
 	log.Debug("deploy to simulated backend")
 
@@ -319,7 +317,7 @@ func TestEmitCheque(t *testing.T) {
 
 	// we wait until the cashCheque is actually terminated (ensures proper nounce count)
 	select {
-	case <-creditorSwap.backend.(*swapTestBackend).cashDone:
+	case <-cashChequeDone:
 		log.Debug("cash transaction completed and committed")
 	case <-time.After(4 * time.Second):
 		t.Fatalf("Timeout waiting for cash transaction to complete")
@@ -342,9 +340,6 @@ func TestTriggerPaymentThreshold(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// setup the wait for mined transaction function for testing
-	cleanup := setupContractTest()
-	defer cleanup()
 
 	if err = protocolTester.testHandshake(
 		correctSwapHandshakeMsg(debitorSwap),

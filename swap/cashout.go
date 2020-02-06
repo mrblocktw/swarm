@@ -30,10 +30,9 @@ import (
 // CashChequeBeneficiaryTransactionCost is the expected gas cost of a CashChequeBeneficiary transaction
 const CashChequeBeneficiaryTransactionCost = 50000
 
-// CashoutProcessor holds all relevant fields needed for processing cashouts
-type CashoutProcessor struct {
-	backend    chain.Backend     // ethereum backend to use
-	privateKey *ecdsa.PrivateKey // private key to use
+var CashoutRequestTypeID = chain.TransactionRequestTypeID{
+	Handler:     "cashout",
+	RequestType: "CashoutRequest",
 }
 
 // CashoutRequest represents a request for a cashout operation
@@ -42,42 +41,106 @@ type CashoutRequest struct {
 	Destination common.Address // destination for the payout
 }
 
-// ActiveCashout stores the necessary information for a cashout in progess
-type ActiveCashout struct {
-	Request         CashoutRequest // the request that caused this cashout
-	TransactionHash common.Hash    // the hash of the current transaction for this request
+// CashoutProcessor holds all relevant fields needed for processing cashouts
+type CashoutProcessor struct {
+	backend     chain.Backend     // ethereum backend to use
+	txScheduler chain.TxScheduler // transaction queue to use
+	cashoutDone chan *CashoutRequest
 }
 
 // newCashoutProcessor creates a new instance of CashoutProcessor
-func newCashoutProcessor(backend chain.Backend, privateKey *ecdsa.PrivateKey) *CashoutProcessor {
-	return &CashoutProcessor{
-		backend:    backend,
-		privateKey: privateKey,
+func newCashoutProcessor(txScheduler chain.TxScheduler, backend chain.Backend, privateKey *ecdsa.PrivateKey) *CashoutProcessor {
+	c := &CashoutProcessor{
+		backend:     backend,
+		txScheduler: txScheduler,
 	}
+
+	txScheduler.SetHandlers(CashoutRequestTypeID, &chain.TransactionRequestHandlers{
+		Send: func(id uint64, backend chain.Backend, opts *bind.TransactOpts) (common.Hash, error) {
+			var request CashoutRequest
+			if err := c.txScheduler.GetRequest(id, &request); err != nil {
+				return common.Hash{}, err
+			}
+
+			cheque := request.Cheque
+
+			otherSwap, err := contract.InstanceAt(cheque.Contract, backend)
+			if err != nil {
+				return common.Hash{}, err
+			}
+
+			tx, err := otherSwap.CashChequeBeneficiaryStart(opts, request.Destination, cheque.CumulativePayout, cheque.Signature)
+			if err != nil {
+				return common.Hash{}, err
+			}
+			return tx.Hash(), nil
+		},
+		NotifyReceipt: func(id uint64, notification *chain.TransactionReceiptNotification) error {
+			var request *CashoutRequest
+			err := c.txScheduler.GetRequest(id, &request)
+			if err != nil {
+				return err
+			}
+
+			otherSwap, err := contract.InstanceAt(request.Cheque.Contract, c.backend)
+			if err != nil {
+				return err
+			}
+
+			receipt := &notification.Receipt
+			if receipt.Status == 0 {
+				swapLog.Error("cheque cashing transaction reverted", "tx", receipt.TxHash)
+				return nil
+			}
+
+			result := otherSwap.CashChequeBeneficiaryResult(receipt)
+
+			metrics.GetOrRegisterCounter("swap.cheques.cashed.honey", nil).Inc(result.TotalPayout.Int64())
+
+			if result.Bounced {
+				metrics.GetOrRegisterCounter("swap.cheques.cashed.bounced", nil).Inc(1)
+				swapLog.Warn("cheque bounced", "tx", receipt.TxHash)
+			}
+
+			swapLog.Info("cheque cashed", "honey", request.Cheque.Honey)
+
+			select {
+			case c.cashoutDone <- request:
+			default:
+			}
+
+			return nil
+		},
+	})
+	return c
 }
 
-// cashCheque tries to cash the cheque specified in the request
-// after the transaction is sent it waits on its success
-func (c *CashoutProcessor) cashCheque(ctx context.Context, request *CashoutRequest) error {
-	cheque := request.Cheque
-	opts := bind.NewKeyedTransactor(c.privateKey)
-	opts.Context = ctx
+func (c *CashoutProcessor) setCashoutDoneChan(cashoutDone chan *CashoutRequest) {
+	c.cashoutDone = cashoutDone
+}
 
-	otherSwap, err := contract.InstanceAt(cheque.Contract, c.backend)
+func (c *CashoutProcessor) submitCheque(request *CashoutRequest) {
+	expectedPayout, transactionCosts, err := c.estimatePayout(context.TODO(), &request.Cheque)
 	if err != nil {
-		return err
+		swapLog.Error("could not estimate payout", "error", err)
+		return
 	}
 
-	tx, err := otherSwap.CashChequeBeneficiaryStart(opts, request.Destination, cheque.CumulativePayout, cheque.Signature)
+	costsMultiplier := uint256.FromUint64(2)
+	costThreshold, err := uint256.New().Mul(transactionCosts, costsMultiplier)
 	if err != nil {
-		return err
+		swapLog.Error("overflow in transaction fee", "error", err)
+		return
 	}
 
-	// this blocks until the cashout has been successfully processed
-	return c.waitForAndProcessActiveCashout(&ActiveCashout{
-		Request:         *request,
-		TransactionHash: tx.Hash(),
-	})
+	// do a payout transaction if we get 2 times the gas costs
+	if expectedPayout.Cmp(costThreshold) == 1 {
+		_, err := c.txScheduler.ScheduleRequest(CashoutRequestTypeID, request)
+		if err != nil {
+			metrics.GetOrRegisterCounter("swap.cheques.cashed.errors", nil).Inc(1)
+			swapLog.Error("cashing cheque:", "error", err)
+		}
+	}
 }
 
 // estimatePayout estimates the payout for a given cheque as well as the transaction cost
@@ -122,32 +185,4 @@ func (c *CashoutProcessor) estimatePayout(ctx context.Context, cheque *Cheque) (
 	}
 
 	return expectedPayout, transactionCosts, nil
-}
-
-// waitForAndProcessActiveCashout waits for activeCashout to complete
-func (c *CashoutProcessor) waitForAndProcessActiveCashout(activeCashout *ActiveCashout) error {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultTransactionTimeout)
-	defer cancel()
-
-	receipt, err := chain.WaitMined(ctx, c.backend, activeCashout.TransactionHash)
-	if err != nil {
-		return err
-	}
-
-	otherSwap, err := contract.InstanceAt(activeCashout.Request.Cheque.Contract, c.backend)
-	if err != nil {
-		return err
-	}
-
-	result := otherSwap.CashChequeBeneficiaryResult(receipt)
-
-	metrics.GetOrRegisterCounter("swap.cheques.cashed.honey", nil).Inc(result.TotalPayout.Int64())
-
-	if result.Bounced {
-		metrics.GetOrRegisterCounter("swap.cheques.cashed.bounced", nil).Inc(1)
-		swapLog.Warn("cheque bounced", "tx", receipt.TxHash)
-	}
-
-	swapLog.Info("cheque cashed", "honey", activeCashout.Request.Cheque.Honey)
-	return nil
 }

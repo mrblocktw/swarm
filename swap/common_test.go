@@ -34,8 +34,6 @@ type swapTestBackend struct {
 	*mock.TestBackend
 	factoryAddress common.Address // address of the SimpleSwapFactory in the simulated network
 	tokenAddress   common.Address // address of the token in the simulated network
-	// the async cashing go routine needs synchronization for tests
-	cashDone chan struct{}
 }
 
 var defaultBackend = backends.NewSimulatedBackend(core.GenesisAlloc{
@@ -104,7 +102,9 @@ func newBaseTestSwapWithParams(t *testing.T, key *ecdsa.PrivateKey, params *Para
 	if err != nil {
 		t.Fatal(err)
 	}
-	swap := newSwapInstance(stateStore, owner, backend, 10, params, factory)
+
+	txqueue := chain.NewTxQueue(stateStore, "chain", backend, owner.privateKey)
+	swap := newSwapInstance(stateStore, owner, backend, 10, params, factory, txqueue)
 	return swap, dir
 }
 
@@ -125,6 +125,7 @@ func newTestSwap(t *testing.T, key *ecdsa.PrivateKey, backend *swapTestBackend) 
 		usedBackend = newTestBackend(t)
 	}
 	swap, dir := newBaseTestSwap(t, key, usedBackend)
+	swap.txScheduler.Start()
 	clean := func() {
 		swap.Close()
 		// only close if created by newTestSwap to avoid double close
@@ -205,32 +206,6 @@ func newRandomTestCheque() *Cheque {
 	return cheque
 }
 
-// During tests, because the cashing in of cheques is async, we should wait for the function to be returned
-// Otherwise if we call `handleEmitChequeMsg` manually, it will return before the TX has been committed to the `SimulatedBackend`,
-// causing subsequent TX to possibly fail due to nonce mismatch
-func testCashCheque(s *Swap, cheque *Cheque) {
-	cashCheque(s, cheque)
-	// send to the channel, signals to clients that this function actually finished
-	if stb, ok := s.backend.(*swapTestBackend); ok {
-		if stb.cashDone != nil {
-			stb.cashDone <- struct{}{}
-		}
-	}
-}
-
-// setupContractTest is a helper function for setting up the
-// blockchain wait function for testing
-func setupContractTest() func() {
-	// we also need to store the previous cashCheque function in case this is called multiple times
-	currentCashCheque := defaultCashCheque
-	defaultCashCheque = testCashCheque
-	// overwrite only for the duration of the test, so...
-	return func() {
-		// ...we need to set it back to original when done
-		defaultCashCheque = currentCashCheque
-	}
-}
-
 // deploy for testing (needs simulated backend commit)
 func testDeployWithPrivateKey(ctx context.Context, backend chain.Backend, privateKey *ecdsa.PrivateKey, ownerAddress common.Address, depositAmount *uint256.Uint256) (cswap.Contract, error) {
 	opts := bind.NewKeyedTransactor(privateKey)
@@ -247,9 +222,6 @@ func testDeployWithPrivateKey(ctx context.Context, backend chain.Backend, privat
 		return nil, err
 	}
 
-	// setup the wait for mined transaction function for testing
-	cleanup := setupContractTest()
-	defer cleanup()
 	contract, err := factory.DeploySimpleSwap(opts, ownerAddress, big.NewInt(int64(defaultHarddepositTimeoutDuration)))
 	if err != nil {
 		return nil, err

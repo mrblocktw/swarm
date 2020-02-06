@@ -641,10 +641,6 @@ func TestResetBalance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// setup the wait for mined transaction function for testing
-	cleanup := setupContractTest()
-	defer cleanup()
-
 	// now simulate sending the cheque to the creditor from the debitor
 	if err = creditor.sendCheque(); err != nil {
 		t.Fatal(err)
@@ -667,8 +663,11 @@ func TestResetBalance(t *testing.T) {
 	msg := &EmitChequeMsg{
 		Cheque: cheque,
 	}
-	// now we need to create the channel...
-	testBackend.cashDone = make(chan struct{})
+
+	cashChequeDone := make(chan *CashoutRequest)
+	defer close(cashChequeDone)
+	creditorSwap.cashoutProcessor.setCashoutDoneChan(cashChequeDone)
+
 	// ...and trigger message handling on the receiver side (creditor)
 	// remember that debitor is the model of the remote node for the creditor...
 	err = creditorSwap.handleEmitChequeMsg(ctx, debitor, msg)
@@ -677,7 +676,7 @@ func TestResetBalance(t *testing.T) {
 	}
 	// ...on which we wait until the cashCheque is actually terminated (ensures proper nounce count)
 	select {
-	case <-testBackend.cashDone:
+	case <-cashChequeDone:
 		log.Debug("cash transaction completed and committed")
 	case <-time.After(4 * time.Second):
 		t.Fatalf("Timeout waiting for cash transactions to complete")
@@ -1294,10 +1293,6 @@ func TestSwapLogToFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// setup the wait for mined transaction function for testing
-	cleanup := setupContractTest()
-	defer cleanup()
-
 	// now simulate sending the cheque to the creditor from the debitor
 	if err = creditor.sendCheque(); err != nil {
 		t.Fatal(err)
@@ -1351,8 +1346,6 @@ func TestAvailableBalance(t *testing.T) {
 	defer testBackend.Close()
 	swap, clean := newTestSwap(t, ownerKey, testBackend)
 	defer clean()
-	cleanup := setupContractTest()
-	defer cleanup()
 
 	depositAmount := uint256.FromUint64(9000 * RetrieveRequestPrice)
 
